@@ -10,9 +10,13 @@ const END_HOUR = 21;
 const TOTAL_HOURS = END_HOUR - START_HOUR;
 const SNAP_MINUTES = 15;
 const GUTTER_WIDTH = 56;
+const MAPPING_KEY = "gcal-zoho-mappings";
 
 interface Project { id_string: string; name: string; }
 interface Task { id: string; prefix: string; name: string; tasklist: { name: string; id: string }; subtask: { level: string }; is_closed: boolean; }
+
+interface MappingEntry { projectId: string; taskId: string; }
+type MappingConfig = Record<string, MappingEntry>;
 
 interface DraftLog {
   id: string;
@@ -125,6 +129,19 @@ export default function CalendarPage() {
   const [googleEvents, setGoogleEvents] = useState<GoogleEvent[]>([]);
   const [googleConnected, setGoogleConnected] = useState<boolean | null>(null);
   const [hoveredEventId, setHoveredEventId] = useState<string | null>(null);
+  const [showMapping, setShowMapping] = useState(false);
+  const [mappingTab, setMappingTab] = useState<"config" | "apply">("config");
+  const [mappingConfig, setMappingConfig] = useState<MappingConfig>(() => {
+    try {
+      const raw = typeof window !== "undefined" ? localStorage.getItem(MAPPING_KEY) : null;
+      return raw ? JSON.parse(raw) : {};
+    } catch { return {}; }
+  });
+  const [mappingTasksCache, setMappingTasksCache] = useState<Record<string, Task[]>>({});
+  const [mappingTaskOpen, setMappingTaskOpen] = useState<string | null>(null);
+  const [mappingTaskSearch, setMappingTaskSearch] = useState("");
+  const [applySelected, setApplySelected] = useState<Set<string>>(new Set());
+  const [applyDays, setApplyDays] = useState<Set<number>>(new Set([0, 1, 2, 3, 4]));
   const gridRef = useRef<HTMLDivElement>(null);
   const taskDropdownRef = useRef<HTMLDivElement>(null);
 
@@ -133,6 +150,7 @@ export default function CalendarPage() {
       .then(r => r.json())
       .then(data => setProjects(data.projects ?? []));
   }, []);
+
 
   useEffect(() => {
     if (!taskProjectId) return;
@@ -292,6 +310,56 @@ export default function CalendarPage() {
   }, {});
   const canSave = drafts.length > 0 && drafts.every(d => d.projectId && d.taskId);
 
+  const distinctEventTitles = useMemo(
+    () => [...new Set(googleEvents.map(e => e.title))].sort(),
+    [googleEvents]
+  );
+
+  async function fetchMappingTasks(projectId: string) {
+    if (!projectId || mappingTasksCache[projectId]) return;
+    const data = await fetch(`/api/zoho/projects/${projectId}/tasks`).then(r => r.json());
+    setMappingTasksCache(prev => ({ ...prev, [projectId]: Array.isArray(data) ? data : (data.tasks ?? []) }));
+  }
+
+  function updateMapping(title: string, patch: Partial<MappingEntry>) {
+    setMappingConfig(prev => {
+      const existing = prev[title] ?? { projectId: "", taskId: "" };
+      return { ...prev, [title]: { ...existing, ...patch } };
+    });
+  }
+
+  function saveMappings() {
+    localStorage.setItem(MAPPING_KEY, JSON.stringify(mappingConfig));
+    setShowMapping(false);
+    setMappingTaskOpen(null);
+  }
+
+  function applyMappings() {
+    const newDrafts: DraftLog[] = [];
+    for (const title of applySelected) {
+      const entry = mappingConfig[title];
+      if (!entry?.projectId || !entry?.taskId) continue;
+      const template = googleEvents.find(e => e.title === title);
+      if (!template) continue;
+      for (const dayIdx of applyDays) {
+        if (!weekDates[dayIdx]) continue;
+        newDrafts.push({
+          id: crypto.randomUUID(),
+          date: toDateStr(weekDates[dayIdx]),
+          startMinutes: template.startMinutes,
+          endMinutes: template.endMinutes,
+          projectId: entry.projectId,
+          taskId: entry.taskId,
+          notes: title,
+          billable: false,
+        });
+      }
+    }
+    setDrafts(prev => [...prev, ...newDrafts]);
+    setShowMapping(false);
+    setApplySelected(new Set());
+  }
+
   return (
     <div className="flex flex-col h-screen bg-white select-none">
       {/* Top bar */}
@@ -341,6 +409,17 @@ export default function CalendarPage() {
               </svg>
               Google Calendar
             </span>
+          )}
+          {googleConnected === true && (
+            <button
+              onClick={() => { setShowMapping(true); setMappingTaskOpen(null); }}
+              className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-gray-200 hover:bg-gray-50 text-gray-600 transition-colors"
+            >
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M8 7h12M8 12h12M8 17h12M3 7h.01M3 12h.01M3 17h.01" />
+              </svg>
+              Map Events
+            </button>
           )}
           {saveError && <span className="text-xs text-red-500">{saveError}</span>}
           {drafts.length > 0 && (
@@ -518,6 +597,299 @@ export default function CalendarPage() {
       </div>
 
       {/* Edit panel (slide-in from right) */}
+      {/* Event Mapping panel */}
+      {showMapping && (
+        <div className="fixed inset-0 z-50 flex" onClick={() => setShowMapping(false)}>
+          <div className="flex-1" />
+          <div
+            className="w-96 bg-white shadow-2xl border-l flex flex-col"
+            onClick={e => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div className="flex items-center justify-between px-5 py-4 border-b shrink-0">
+              <p className="font-semibold text-gray-900 text-sm">Calendar Event Mapping</p>
+              <button onClick={() => setShowMapping(false)} className="text-gray-400 hover:text-gray-600 p-1 rounded hover:bg-gray-100">
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            {/* Tab toggle */}
+            <div className="flex border-b shrink-0">
+              <button
+                onClick={() => setMappingTab("config")}
+                className={`flex-1 py-2.5 text-xs font-medium transition-colors ${mappingTab === "config" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
+              >
+                Mapping Config
+              </button>
+              <button
+                onClick={() => setMappingTab("apply")}
+                className={`flex-1 py-2.5 text-xs font-medium transition-colors ${mappingTab === "apply" ? "text-blue-600 border-b-2 border-blue-600" : "text-gray-500 hover:text-gray-700"}`}
+              >
+                Apply Mappings
+              </button>
+            </div>
+
+            {/* Config tab */}
+            {mappingTab === "config" && (
+              <>
+                <div className="flex-1 overflow-y-auto p-5 space-y-5">
+                  {distinctEventTitles.length === 0 && (
+                    <p className="text-xs text-gray-400 text-center py-8">No events found for this week.</p>
+                  )}
+                  {distinctEventTitles.map(title => {
+                    const entry = mappingConfig[title] ?? { projectId: "", taskId: "" };
+                    const rowTasks = mappingTasksCache[entry.projectId] ?? [];
+                    const isOpen = mappingTaskOpen === title;
+                    const q = isOpen ? mappingTaskSearch.toLowerCase() : "";
+                    const filtered = rowTasks.filter(t => !q || t.name.toLowerCase().includes(q) || t.prefix.toLowerCase().includes(q));
+                    const groups = filtered.reduce<Record<string, Task[]>>((acc, t) => {
+                      const g = t.tasklist?.name ?? "Tasks";
+                      (acc[g] ??= []).push(t);
+                      return acc;
+                    }, {});
+                    return (
+                      <div key={title} className="space-y-2 pb-4 border-b border-gray-100 last:border-0">
+                        <div className="flex items-center gap-2">
+                          <span className="w-2 h-2 rounded-full bg-green-400 shrink-0" />
+                          <p className="text-sm font-medium text-gray-800 truncate">{title}</p>
+                        </div>
+                        <select
+                          value={entry.projectId}
+                          onChange={e => {
+                            updateMapping(title, { projectId: e.target.value, taskId: "" });
+                            fetchMappingTasks(e.target.value);
+                            setMappingTaskOpen(null);
+                          }}
+                          className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        >
+                          <option value="">Select project…</option>
+                          {projects.map(p => <option key={p.id_string} value={p.id_string}>{p.name}</option>)}
+                        </select>
+                        <div>
+                          <button
+                            type="button"
+                            disabled={!entry.projectId}
+                            onClick={() => {
+                              setMappingTaskOpen(isOpen ? null : title);
+                              setMappingTaskSearch("");
+                              if (entry.projectId) fetchMappingTasks(entry.projectId);
+                            }}
+                            className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm text-left focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-40 flex items-center justify-between bg-white"
+                          >
+                            <span className={entry.taskId ? "text-gray-900 truncate" : "text-gray-400"}>
+                              {entry.taskId ? (rowTasks.find(t => t.id === entry.taskId)?.name ?? "Select task…") : "Select task…"}
+                            </span>
+                            <svg className="w-3.5 h-3.5 text-gray-400 shrink-0 ml-2" viewBox="0 0 20 20" fill="currentColor">
+                              <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z" clipRule="evenodd" />
+                            </svg>
+                          </button>
+                          {isOpen && entry.projectId && (
+                            <div className="mt-1 border border-gray-200 rounded-xl shadow-lg bg-white overflow-hidden">
+                              <div className="px-3 py-2 border-b border-gray-100">
+                                <div className="flex items-center gap-2 px-2.5 py-1.5 bg-gray-50 rounded-lg border border-gray-200 focus-within:border-blue-400 focus-within:bg-white transition-colors">
+                                  <svg className="w-3.5 h-3.5 text-gray-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                                    <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z" />
+                                  </svg>
+                                  <input
+                                    autoFocus
+                                    type="text"
+                                    placeholder="Search tasks…"
+                                    value={mappingTaskSearch}
+                                    onChange={e => setMappingTaskSearch(e.target.value)}
+                                    className="bg-transparent flex-1 text-sm outline-none text-gray-700 placeholder-gray-400"
+                                  />
+                                </div>
+                              </div>
+                              <div className="max-h-48 overflow-y-auto">
+                                {filtered.length === 0 && <p className="px-4 py-4 text-xs text-gray-400 text-center">No tasks found</p>}
+                                {Object.entries(groups).map(([listName, listTasks]) => (
+                                  <div key={listName}>
+                                    <div className="px-4 pt-3 pb-1">
+                                      <span className="text-xs font-semibold text-gray-800">{listName}</span>
+                                    </div>
+                                    {listTasks.map(task => {
+                                      const isSel = task.id === entry.taskId;
+                                      return (
+                                        <button
+                                          key={task.id}
+                                          type="button"
+                                          onClick={() => { updateMapping(title, { taskId: task.id }); setMappingTaskOpen(null); }}
+                                          className={`w-full flex items-center gap-2.5 px-4 py-2 text-left hover:bg-gray-50 transition-colors ${isSel ? "bg-blue-50" : ""}`}
+                                        >
+                                          <span className={`w-3.5 h-3.5 rounded-full border-2 shrink-0 ${isSel ? "border-blue-500 bg-blue-100" : "border-orange-400"}`} />
+                                          <span className="text-xs font-mono text-gray-400 shrink-0">{task.prefix}</span>
+                                          <span className={`text-sm truncate ${task.is_closed ? "text-gray-300 line-through" : "text-gray-800"}`}>{task.name}</span>
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="px-5 pb-5 pt-3 border-t shrink-0">
+                  <button
+                    onClick={saveMappings}
+                    className="w-full bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                  >
+                    Save Mappings
+                  </button>
+                </div>
+              </>
+            )}
+
+            {/* Apply tab */}
+            {mappingTab === "apply" && (() => {
+              const mappedTitles = distinctEventTitles.filter(t => {
+                const e = mappingConfig[t];
+                return e?.projectId && e?.taskId;
+              });
+              const allEventsSelected = mappedTitles.length > 0 && mappedTitles.every(t => applySelected.has(t));
+              const allDaysSelected = [0,1,2,3,4].every(d => applyDays.has(d));
+              const applyCount = applySelected.size * applyDays.size;
+              return (
+                <>
+                  <div className="flex-1 overflow-y-auto p-5 space-y-6">
+                    {/* Event list */}
+                    <div>
+                      <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Select Events</p>
+                      {mappedTitles.length === 0 && (
+                        <p className="text-xs text-gray-400 py-4 text-center">No mapped events this week.<br/>Configure mappings in the Config tab first.</p>
+                      )}
+                      {mappedTitles.map(title => {
+                        const entry = mappingConfig[title]!;
+                        const project = projects.find(p => p.id_string === entry.projectId);
+                        const cachedTasks = mappingTasksCache[entry.projectId] ?? [];
+                        const task = cachedTasks.find(t => t.id === entry.taskId);
+                        const template = googleEvents.find(e => e.title === title);
+                        const checked = applySelected.has(title);
+                        return (
+                          <label key={title} className="flex items-start gap-3 py-2.5 cursor-pointer group">
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={e => {
+                                setApplySelected(prev => {
+                                  const next = new Set(prev);
+                                  if (e.target.checked) { next.add(title); } else { next.delete(title); }
+                                  return next;
+                                });
+                              }}
+                              className="mt-0.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                            />
+                            <div className="min-w-0">
+                              <p className="text-sm font-medium text-gray-800 truncate">{title}</p>
+                              <p className="text-xs text-gray-400 truncate mt-0.5">
+                                {project?.name ?? entry.projectId}
+                                {task ? ` / ${task.name}` : ""}
+                              </p>
+                              {template && (
+                                <p className="text-xs text-green-600 mt-0.5">
+                                  {minutesToTime(template.startMinutes)}–{minutesToTime(template.endMinutes)}
+                                </p>
+                              )}
+                            </div>
+                          </label>
+                        );
+                      })}
+                      {mappedTitles.length > 1 && (
+                        <button
+                          type="button"
+                          onClick={() => setApplySelected(allEventsSelected ? new Set() : new Set(mappedTitles))}
+                          className="mt-1 text-xs text-blue-600 hover:underline"
+                        >
+                          {allEventsSelected ? "Deselect all" : "Select all"}
+                        </button>
+                      )}
+                    </div>
+
+                    {/* Day selector */}
+                    <div>
+                      <div className="flex items-center justify-between mb-3">
+                        <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Apply to Days</p>
+                        <button
+                          type="button"
+                          onClick={() => setApplyDays(allDaysSelected ? new Set() : new Set([0,1,2,3,4]))}
+                          className="text-xs text-blue-600 hover:underline"
+                        >
+                          {allDaysSelected ? "Deselect all" : "Select all (Mon–Fri)"}
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-5 gap-1.5">
+                        {weekDates.slice(0, 5).map((date, idx) => {
+                          const checked = applyDays.has(idx);
+                          return (
+                            <button
+                              key={idx}
+                              type="button"
+                              onClick={() => setApplyDays(prev => {
+                                const next = new Set(prev);
+                                if (checked) { next.delete(idx); } else { next.add(idx); }
+                                return next;
+                              })}
+                              className={`flex flex-col items-center py-2 rounded-lg border text-xs font-medium transition-colors ${
+                                checked
+                                  ? "bg-blue-50 border-blue-400 text-blue-700"
+                                  : "border-gray-200 text-gray-500 hover:bg-gray-50"
+                              }`}
+                            >
+                              <span>{DAYS[idx]}</span>
+                              <span className="text-gray-400 font-normal">{date.getDate()}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <div className="grid grid-cols-2 gap-1.5 mt-1.5">
+                        {weekDates.slice(5).map((date, i) => {
+                          const idx = 5 + i;
+                          const checked = applyDays.has(idx);
+                          return (
+                            <button
+                              key={idx}
+                              type="button"
+                              onClick={() => setApplyDays(prev => {
+                                const next = new Set(prev);
+                                if (checked) { next.delete(idx); } else { next.add(idx); }
+                                return next;
+                              })}
+                              className={`flex flex-col items-center py-2 rounded-lg border text-xs font-medium transition-colors ${
+                                checked
+                                  ? "bg-blue-50 border-blue-400 text-blue-700"
+                                  : "border-gray-200 text-gray-500 hover:bg-gray-50"
+                              }`}
+                            >
+                              <span>{DAYS[idx]}</span>
+                              <span className="text-gray-400 font-normal">{date.getDate()}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="px-5 pb-5 pt-3 border-t shrink-0">
+                    <button
+                      onClick={applyMappings}
+                      disabled={applySelected.size === 0 || applyDays.size === 0}
+                      className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white text-sm font-medium py-2 rounded-lg transition-colors"
+                    >
+                      {applyCount > 0 ? `Add ${applyCount} draft log${applyCount !== 1 ? "s" : ""} to calendar` : "Apply"}
+                    </button>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+        </div>
+      )}
+
       {editingDraft && (
         <div className="fixed inset-0 z-50 flex" onClick={() => setEditingId(null)}>
           <div className="flex-1" />
