@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import Link from "next/link";
+import type { GoogleCalendarEvent } from "@/lib/google";
 
 const HOUR_HEIGHT = 64; // px per hour
 const START_HOUR = 7;
@@ -28,6 +29,14 @@ interface DragState {
   dayIndex: number;
   startMinutes: number;
   currentMinutes: number;
+}
+
+interface GoogleEvent {
+  id: string;
+  title: string;
+  dateStr: string;
+  startMinutes: number;
+  endMinutes: number;
 }
 
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -61,6 +70,45 @@ function snapTo(minutes: number) {
   return Math.round(minutes / SNAP_MINUTES) * SNAP_MINUTES;
 }
 
+function parseGoogleEvents(events: GoogleCalendarEvent[]): GoogleEvent[] {
+  const result: GoogleEvent[] = [];
+  for (const ev of events) {
+    // Skip all-day events (no dateTime)
+    if (!ev.start.dateTime || !ev.end.dateTime) continue;
+    const start = new Date(ev.start.dateTime);
+    const end = new Date(ev.end.dateTime);
+    // Split multi-day events per calendar day
+    const startDay = new Date(start);
+    startDay.setHours(0, 0, 0, 0);
+    const endDay = new Date(end);
+    endDay.setHours(0, 0, 0, 0);
+    const days = Math.round((endDay.getTime() - startDay.getTime()) / 86400000) + 1;
+    for (let i = 0; i < days; i++) {
+      const day = new Date(startDay);
+      day.setDate(startDay.getDate() + i);
+      const dayStr = toDateStr(day);
+      const startMins = i === 0
+        ? start.getHours() * 60 + start.getMinutes()
+        : 0;
+      const endMins = i === days - 1
+        ? end.getHours() * 60 + end.getMinutes()
+        : 24 * 60;
+      // Clip to visible range
+      const clampedStart = Math.max(startMins, START_HOUR * 60);
+      const clampedEnd = Math.min(endMins, END_HOUR * 60);
+      if (clampedEnd <= clampedStart) continue;
+      result.push({
+        id: `${ev.id}-${i}`,
+        title: ev.summary ?? "(No title)",
+        dateStr: dayStr,
+        startMinutes: clampedStart,
+        endMinutes: clampedEnd,
+      });
+    }
+  }
+  return result;
+}
+
 export default function CalendarPage() {
   const [weekOffset, setWeekOffset] = useState(0);
   const weekDates = useMemo(() => getWeekDates(weekOffset), [weekOffset]);
@@ -74,9 +122,11 @@ export default function CalendarPage() {
   const [saveError, setSaveError] = useState("");
   const [taskDropdownOpen, setTaskDropdownOpen] = useState(false);
   const [taskSearch, setTaskSearch] = useState("");
+  const [googleEvents, setGoogleEvents] = useState<GoogleEvent[]>([]);
+  const [googleConnected, setGoogleConnected] = useState<boolean | null>(null);
+  const [hoveredEventId, setHoveredEventId] = useState<string | null>(null);
   const gridRef = useRef<HTMLDivElement>(null);
   const taskDropdownRef = useRef<HTMLDivElement>(null);
-
 
   useEffect(() => {
     fetch("/api/zoho/projects")
@@ -90,6 +140,26 @@ export default function CalendarPage() {
       .then(r => r.json())
       .then(data => setTasks(Array.isArray(data) ? data : (data.tasks ?? [])));
   }, [taskProjectId]);
+
+  useEffect(() => {
+    if (weekDates.length === 0) return;
+    const timeMin = new Date(weekDates[0]);
+    timeMin.setHours(0, 0, 0, 0);
+    const timeMax = new Date(weekDates[6]);
+    timeMax.setHours(23, 59, 59, 999);
+    fetch(
+      `/api/google/calendar/events?timeMin=${timeMin.toISOString()}&timeMax=${timeMax.toISOString()}`
+    )
+      .then(r => {
+        if (r.status === 401) { setGoogleConnected(false); return null; }
+        setGoogleConnected(true);
+        return r.json();
+      })
+      .then(data => {
+        if (!data) return;
+        setGoogleEvents(parseGoogleEvents(data.events ?? []));
+      });
+  }, [weekDates]);
 
   const yToMinutes = useCallback((clientY: number): number => {
     if (!gridRef.current) return START_HOUR * 60;
@@ -109,8 +179,8 @@ export default function CalendarPage() {
 
   const onMouseDown = useCallback((e: React.MouseEvent) => {
     if (e.button !== 0) return;
-    // Don't start drag if clicking on an existing draft
     if ((e.target as HTMLElement).closest("[data-draft]")) return;
+    if ((e.target as HTMLElement).closest("[data-gcal]")) return;
     e.preventDefault();
     const start = yToMinutes(e.clientY);
     const dayIndex = xToDayIndex(e.clientX);
@@ -164,7 +234,6 @@ export default function CalendarPage() {
     return () => document.removeEventListener("mousedown", handleClick);
   }, [taskDropdownOpen]);
 
-
   function blockStyle(startMinutes: number, endMinutes: number) {
     const top = ((startMinutes - START_HOUR * 60) / 60) * HOUR_HEIGHT;
     const height = Math.max(((endMinutes - startMinutes) / 60) * HOUR_HEIGHT, 16);
@@ -217,6 +286,10 @@ export default function CalendarPage() {
     (acc[d.date] ??= []).push(d);
     return acc;
   }, {});
+  const gcalByDate = googleEvents.reduce<Record<string, GoogleEvent[]>>((acc, e) => {
+    (acc[e.dateStr] ??= []).push(e);
+    return acc;
+  }, {});
   const canSave = drafts.length > 0 && drafts.every(d => d.projectId && d.taskId);
 
   return (
@@ -243,6 +316,32 @@ export default function CalendarPage() {
           )}
         </div>
         <div className="ml-auto flex items-center gap-3">
+          {/* Google Calendar connect status */}
+          {googleConnected === false && (
+            <a
+              href="/api/google/auth"
+              className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-gray-200 hover:bg-gray-50 text-gray-600 transition-colors"
+            >
+              <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="currentColor">
+                <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
+                <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+                <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/>
+                <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
+              </svg>
+              Connect Google Calendar
+            </a>
+          )}
+          {googleConnected === true && (
+            <span className="flex items-center gap-1.5 text-xs text-green-600 font-medium">
+              <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="currentColor">
+                <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
+                <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+                <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/>
+                <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
+              </svg>
+              Google Calendar
+            </span>
+          )}
           {saveError && <span className="text-xs text-red-500">{saveError}</span>}
           {drafts.length > 0 && (
             <span className="text-xs text-gray-400">{drafts.length} unsaved</span>
@@ -317,12 +416,48 @@ export default function CalendarPage() {
             {weekDates.map((date, dayIndex) => {
               const dateStr = toDateStr(date);
               const dayDrafts = draftsByDate[dateStr] ?? [];
+              const dayGcal = gcalByDate[dateStr] ?? [];
               const isDraggingHere = drag?.dayIndex === dayIndex;
               const dragStart = drag ? Math.min(drag.startMinutes, drag.currentMinutes) : 0;
               const dragEnd = drag ? Math.max(drag.startMinutes, drag.currentMinutes) : 0;
 
               return (
                 <div key={dayIndex} className="relative border-l border-gray-100 h-full">
+                  {/* Google Calendar ghost blocks */}
+                  {dayGcal.map(ev => {
+                    const { top, height } = blockStyle(ev.startMinutes, ev.endMinutes);
+                    const isHovered = hoveredEventId === ev.id;
+                    return (
+                      <div
+                        key={ev.id}
+                        data-gcal="true"
+                        style={{ top, height, left: 2, right: 2 }}
+                        className={`absolute rounded-md px-1.5 py-0.5 z-0 transition-opacity cursor-default ${
+                          isHovered
+                            ? "bg-green-100 border border-green-400 opacity-100"
+                            : "bg-green-50 border border-green-200 opacity-70"
+                        }`}
+                        onMouseEnter={() => setHoveredEventId(ev.id)}
+                        onMouseLeave={() => setHoveredEventId(null)}
+                      >
+                        <p className="text-xs font-medium text-green-700 truncate leading-tight">
+                          {ev.title}
+                        </p>
+                        {height > 28 && (
+                          <p className="text-xs text-green-500 leading-tight">
+                            {minutesToTime(ev.startMinutes)}–{minutesToTime(ev.endMinutes)}
+                          </p>
+                        )}
+                        {isHovered && height <= 28 && (
+                          <div className="absolute left-0 top-full mt-1 z-50 bg-white border border-green-200 rounded-lg shadow-lg px-3 py-2 text-xs text-gray-700 w-48 pointer-events-none">
+                            <p className="font-semibold text-green-700 truncate">{ev.title}</p>
+                            <p className="text-gray-500 mt-0.5">{minutesToTime(ev.startMinutes)}–{minutesToTime(ev.endMinutes)}</p>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+
                   {/* Draft blocks */}
                   {dayDrafts.map(draft => {
                     const { top, height } = blockStyle(draft.startMinutes, draft.endMinutes);
@@ -424,7 +559,6 @@ export default function CalendarPage() {
 
               <div ref={taskDropdownRef}>
                 <label className="block text-xs font-medium text-gray-600 mb-1">Task</label>
-                {/* Trigger button */}
                 <button
                   type="button"
                   disabled={!editingDraft.projectId}
@@ -441,10 +575,8 @@ export default function CalendarPage() {
                   </svg>
                 </button>
 
-                {/* Inline dropdown panel */}
                 {taskDropdownOpen && editingDraft.projectId && (
                   <div className="mt-1 border border-gray-200 rounded-xl shadow-lg bg-white overflow-hidden">
-                    {/* Header */}
                     <div className="flex items-center justify-between px-4 py-2.5 border-b border-gray-100">
                       <span className="text-sm font-semibold text-gray-900">Tasks</span>
                       <span className="text-xs text-gray-500 border border-gray-200 rounded px-2 py-0.5 flex items-center gap-1 cursor-default">
@@ -455,7 +587,6 @@ export default function CalendarPage() {
                       </span>
                     </div>
 
-                    {/* Search */}
                     <div className="px-3 py-2 border-b border-gray-100">
                       <div className="flex items-center gap-2 px-2.5 py-1.5 bg-gray-50 rounded-lg border border-gray-200 focus-within:border-blue-400 focus-within:bg-white transition-colors">
                         <svg className="w-3.5 h-3.5 text-gray-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -472,11 +603,9 @@ export default function CalendarPage() {
                       </div>
                     </div>
 
-                    {/* Task list grouped by tasklist */}
                     <div className="max-h-64 overflow-y-auto">
                       {(() => {
                         const draft = editingDraft;
-
                         const q = taskSearch.toLowerCase();
                         const filtered = tasks.filter(t =>
                           !q ||
